@@ -1,0 +1,205 @@
+# Verification Protocol
+
+A TRACE verifier authenticates a signed record and evaluates the evidence required by the recipient's policy. Offline verification needs the relevant artifacts and trust inputs already available. It cannot infer missing hardware, revocation, or transparency evidence from the record's assertions.
+
+## Five-step verification
+
+This is an implementation guide to [section 3.3 of the specification](https://trace.agentrust-io.com/spec/trace-v0.2/index.md), which remains authoritative. For a runnable Python example, use [verify a trust record](https://trace.agentrust-io.com/docs/tutorials/verifying-a-trust-record/index.md).
+
+### Step 1: Parse the envelope
+
+Validate the complete standalone record against the canonical schema and supported EAT profile. A cMCP `RuntimeClaim` is a different envelope and requires its runtime-specific verifier.
+
+### Step 2: Resolve the public key
+
+Obtain an approved issuer key through the recipient's own trust configuration. The incoming `cnf.jwk` cannot establish its own authority. The trusted key and signed confirmation key must match under the signature profile.
+
+### Step 3: Verify the signature
+
+Use `agentrust_trace.verify_record(record, public_key_or_jwk=trusted_key)`. It checks the standalone schema, supported profile, key binding, and Ed25519 signature, with configured freshness, nonce, and revocation inputs. It rejects missing trust input by default. The signature covers every field except `signature`, including `cnf` and any `transparency` value, using RFC 8785 canonicalization.
+
+A signature proves a statement came from the trusted key. It does not establish the truth of every claim in that statement.
+
+### Step 4: Check the EAT profile
+
+The current SDK requires `tag:agentrust-io.com,2026:trace-v0.2`. The superseded v0.1 identifier is rejected. This check is already included in `verify_record`; a custom verifier must also enforce its supported profile.
+
+### Step 5: Appraise the claims
+
+Resolve and verify the evidence your policy requires: hardware reports, expected measurements, policy and transcript artifacts, build provenance, revocation state, and transparency proofs. The record's `appraisal.status` is itself a signed claim, not an independent appraisal performed by `verify_record`.
+
+| Claimed status    | Interpretation                                                                               |
+| ----------------- | -------------------------------------------------------------------------------------------- |
+| `affirming`       | The issuer reports a successful appraisal; verify its authority, evidence, scope, and policy |
+| `warning`         | The issuer reports conditions that need recipient policy handling                            |
+| `contraindicated` | The issuer reports failed appraisal                                                          |
+| `none`            | No appraisal is claimed                                                                      |
+
+The recipient decides whether the checks performed satisfy the operation's requirements. A non-software platform name or `affirming` string alone is insufficient.
+
+## Checking revocation status
+
+Signature verification alone cannot discover a later key revocation. Offline appraisal requires cached revocation evidence as well as the record and trusted key. Report which evidence was checked and whether it remains current.
+
+[§3.2.3 of the spec](https://trace.agentrust-io.com/spec/trace-v0.2/index.md) closes that gap without giving up offline verification. Two things are worth knowing before reading the code below.
+
+**The boundary is a log entry ID, not a time.** The intuitive rule is to reject a record from a revoked key when its `iat` falls after the compromise. A compromised record-signing key also signs `iat`, so whoever holds it backdates the record and the rule passes. §3.2.3 anchors to the SCITT inclusion entry ID instead, because entry IDs are monotonic and bound to the Merkle structure, so ordering survives the compromise of the signing key in a way a timestamp does not. In §3.2.3's words, a record from a revoked key is valid *"if and only if its SCITT inclusion entry ID is less than or equal to `last_valid_entry_id`"*, on the log named in the statement.
+
+**Offline is a state you report, not a check you skip.** Revocation statements are anchored in the same transparency log as the records they govern, and verifiers cache a signed bundle carrying `valid_until`. A verifier offline says what it checked against, "verified against revocation bundle valid at T", rather than reporting an affirming appraisal it did not earn. §3.2.3 states that an expired bundle *"MUST report the record as unverified for revocation rather than as verified"*, and that a verifier with no bundle *"MUST report that it performed no revocation check"*.
+
+A record with no usable inclusion entry ID has no anchor to place it before or after the compromise, so §3.2.3 falls back to binary revocation for it: *"a verifier MUST reject every record signed by the revoked key"*. That fallback is what `verify_record()` implements for both the store and the bundle, and it is the correct behaviour for deployments carrying no receipts.
+
+`verify_record()` takes a `revocation` store to do this. Pass a container of revoked identifiers, or a callable that performs a live lookup:
+
+```
+from agentrust_trace import jwk_thumbprint, verify_record
+
+# A revocation list the caller already holds.
+verify_record(record, trusted_jwk, revocation={"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k"})
+
+# Or a live CRL / status endpoint / SCITT lookup.
+def is_revoked(key_id: str) -> bool:
+    return httpx.get(f"https://crl.example.org/keys/{key_id}").json()["revoked"]
+
+verify_record(record, trusted_jwk, revocation=is_revoked)
+```
+
+Keys are identified by their RFC 7638 JWK Thumbprint (`jwk_thumbprint(jwk)`) or by `kid`; a match on either rejects the record. The check reads the **trusted** key, not `record["cnf"]["jwk"]`: the embedded key is attacker-controlled until the signature verifies, so keying the lookup on it would let a revoked issuer present an unlisted thumbprint.
+
+Both failure modes raise `ValueError`, including a store that cannot answer:
+
+| Outcome                               | Result                                                                                                                |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Key listed as revoked                 | Rejected                                                                                                              |
+| Store raises (endpoint down, timeout) | Rejected; an unavailable source is not evidence a key is unrevoked                                                    |
+| Key absent from the store             | Verification continues; the result reports `verified` with `source: "store"` and no horizon, because a store has none |
+| No `revocation` passed and no bundle  | Verification continues; the result reports `no_check_performed`                                                       |
+
+The last row is the honest default. Omitting the store is a legitimate mode, since air-gapped audit of archived records has no other option, but the result means "this record was validly signed by this key", not "this key is still trusted", and the result says so rather than leaving it implied.
+
+`verify_record()` also consumes the bundle format §3.2.3 publishes. Pass `revocation_bundle`, a `TraceRevocationBundle/1.0` object, and `trusted_bundle_keys`, the JWKs whose signatures the caller accepts on a bundle:
+
+```
+result = verify_record(
+    record, trusted_jwk,
+    revocation_bundle=bundle, trusted_bundle_keys=[bundle_signer_jwk],
+    max_bundle_age_seconds=86400, now=verification_time,
+)
+result.revocation.outcome    # "verified" | "unverified_for_revocation" | "no_check_performed"
+result.revocation.cause      # why a supplied bundle could not ground "verified", or None
+result.revocation.evidence   # what a second verifier needs to reach the same outcome
+```
+
+The three outcomes are §3.2.3's own words, and none of them is an appraisal: where a verifier records an unresolvable check in the record itself is the question [#190](https://github.com/agentrust-io/trace-spec/issues/190) holds open. A bundle is evidence only while both age bounds hold, the issuer's `valid_until` and the caller's `max_bundle_age_seconds` measured from `issued_at`; the tighter bound governs, and an expired outcome names which one tripped. `now` pins the verification moment so the outcome reproduces from retained facts. A bundle that is malformed, signed by a key not in `trusted_bundle_keys`, signed with an algorithm this build cannot verify, dated in the future, or expired under either bound yields `unverified_for_revocation` with the cause named; it does not raise, because inability to check is not evidence of a defect. A statement on the bundle's log naming the trusted key raises, under the fallback above, and it is read before the time checks: the bounds say what the bundle's silence is worth, and an authenticated statement has no expiry of its own. [`examples/revocation-bundle/`](https://github.com/agentrust-io/trace-spec/tree/main/examples/revocation-bundle/) carries the conformance vectors.
+
+What neither path does yet is entry-ID-scoped revocation. Both answer "is this key revoked", which is the §3.2.3 fallback, so a key revoked after a long run of legitimate records currently invalidates all of them rather than the ones logged after `last_valid_entry_id`. Carrying the entry ID through `verify_record()` is implementation work tracked in the issue that produced §3.2.3. The bundle path also verifies the bundle signature only, not each statement's own signature against the §3.2.1 hierarchy; that check needs the hierarchy, and it is stated here rather than implied.
+
+## Verifying hardware-rooted records
+
+Hardware appraisal supports Level 1; Level 2 adds transparency anchoring. Verify the report or quote signature and accepted trust chain, its freshness and platform policy, the independently approved measurement, and its binding to the record-signing key. The producing profile defines that binding.
+
+`verify_record` does not perform these hardware checks. Comparing a record's digest to an unauthenticated reference or reading `affirming` is not a substitute. See [attestation platforms](https://trace.agentrust-io.com/docs/platforms/index.md) and the producing runtime's verifier.
+
+## Verifying build provenance depth
+
+The normative rules are defined by [§3.3.1 of the specification](https://trace.agentrust-io.com/spec/trace-v0.2/index.md). `build_provenance.provenance_depth` declares how far down the supply chain the issuer claims to have walked. A verifier records what it actually checked in `appraisal.provenance_depth_verified`, which is a statement about the verifier, not about the record.
+
+| Claimed depth         | Verifier checks                                                                                                                                                                                                               | May downgrade to, evidence does not resolve                                                                                             | Fails, evidence resolves and contradicts                                                                                |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `surface` (or absent) | Confirm `digest` matches the workload artifact and `builder` resolves to the configured trusted-builder set.                                                                                                                  | Already the floor.                                                                                                                      | `digest` does not match the artifact the verifier independently holds, or `builder` is outside the trusted-builder set. |
+| `builder`             | All of surface, plus fetch `provenance_uri`, verify the SLSA attestation signature, check the attestation `subject` matches `digest`, and check the attestation `builder.id` matches `builder`.                               | `surface`, when `provenance_uri` is absent or unreachable, or its signature does not resolve.                                           | The attestation resolves and its `subject` does not match `digest`, or its `builder.id` does not match `builder`.       |
+| `transitive`          | All of builder, plus enumerate the SLSA `materials` / `resolvedDependencies` and confirm every entry has a verifiable publisher attestation (npm OIDC, PyPI Trusted Publisher, Sigstore Rekor entry, or platform equivalent). | `builder`, when an input carries no publisher attestation or the attestation declares no inputs at all; or `surface` per the row above. | An input's publisher attestation resolves and was signed under an issuer outside the configured trusted set.            |
+
+The two right-hand columns are disjoint, and which one applies turns on whether the evidence resolved, not on how serious the finding is.
+
+**Evidence that does not resolve** leaves a check unrun. The verifier may stop at the depth below, then records that lower depth in `appraisal.provenance_depth_verified`, and does not report the missing evidence as a failure of the record. A record is not defective because someone else's transparency log is unreachable, and a verifier that rejects on this is failing records for the weather.
+
+**Evidence that resolves and contradicts the record** fails the appraisal. A verifier does not downgrade to escape it. Downgrading there would record a narrower claim that is true while suppressing a wider one that is false: the record would pass as `builder` on evidence that positively refutes it at `transitive`, and the appraisal would say nothing about why.
+
+A verifier does not record `provenance_depth_verified` at a depth higher than it executed. Downgrading is how a verifier stays honest when evidence does not resolve; claiming depth it did not run is what the field exists to prevent. This last rule cannot be expressed in JSON Schema: the record is byte-identical whether the verifier walked the chain or merely says it did. The conformance vectors in [`examples/build-provenance-depth/`](https://github.com/agentrust-io/trace-spec/tree/main/examples/build-provenance-depth) hold it instead, against a verifier's own output, and encode the split above vector by vector.
+
+Records that omit `provenance_depth` are treated as `surface`. This keeps every record issued before this field existed valid and correctly interpreted.
+
+### Profile floors
+
+Deployment profiles select the minimum acceptable verified depth:
+
+| Profile                                           | Floor                                                                     |
+| ------------------------------------------------- | ------------------------------------------------------------------------- |
+| Default, SLSA L0 to L1                            | `surface`                                                                 |
+| SLSA L2 and above                                 | `builder`                                                                 |
+| FIPS-aligned, EU AI Act Annex IV high-risk, HIPAA | `transitive`                                                              |
+| cMCP reference profile                            | `builder`, with `transitive` recommended where ecosystem coverage permits |
+
+A verifier whose configured floor is not met by `provenance_depth_verified` sets `appraisal.status` to `contraindicated`.
+
+### Why depth is recorded rather than assumed
+
+A SLSA attestation produced by a trusted builder is signature-valid even when a maintainer's CI token has been stolen and used to publish a poisoned build input. Surface verification accepts that record. Transitive verification rejects it, because the poisoned input's publisher attestation does not chain back to the legitimate maintainer. Without a recorded depth, two conformant verifiers reach opposite conclusions on the same record and neither says why, which is the federation gap [section 1](https://trace.agentrust-io.com/spec/trace-v0.2/index.md) names.
+
+That case is a failure and not a downgrade, and it is the sharpest reason the two are kept apart. The poisoned input's attestation resolved: the verifier holds it and can see the issuer is outside the trusted set. A verifier permitted to call that "transitive coverage unavailable" would record `builder`, accept, and report exactly what a verifier that never looked reports: which would make the depth field cover for the attack it was added to expose.
+
+### `transitive` is a floor on effort, not a comparable claim
+
+Until evidence resolution is standardized, two verifiers can both honestly record `transitive` over different material sets. Nothing above specifies which inputs must be enumerated or where a publisher attestation must be looked up, so the value states how far a verifier walked, not what ground it covered. `builder` has no such gap, because `provenance_uri` names its own evidence. A consumer comparing `transitive` across verifiers is therefore comparing effort; it does not license the inference that the same dependencies were checked. Specifying a transitive coverage URI is left to a follow-up.
+
+[Build provenance depth](https://trace.agentrust-io.com/docs/build-provenance-depth/index.md) is the informative companion to this section: it states what each depth does not assure.
+
+## CLI verification
+
+The reference SDK exposes a Python API; it does not install an `agentrust-trace` command. Follow the [complete verification script](https://trace.agentrust-io.com/docs/tutorials/verifying-a-trust-record/index.md) to load a saved record and independently trusted public key. Hardware appraisal requires a provider-specific verifier and evidence inputs.
+
+## SCITT-anchored records
+
+A `transparency` URI names a claimed log entry. It does not establish inclusion by itself. Retrieve the receipt, verify its binding to the record, and verify the inclusion proof against an independently trusted log or checkpoint. See [anchoring to the registry](https://trace.agentrust-io.com/docs/tutorials/anchoring-to-the-registry/index.md) for the reference format and sequence.
+
+An authenticated inclusion proof establishes inclusion under that checkpoint. It does not establish the truth of the record's claims, complete logging, or future log availability.
+
+## Action receipts and embodied workflows
+
+Some deployments attach per-action receipts below the session layer. For example, an embodied-agent controller can sign a receipt that says a specific call was accepted, rejected, aborted, or handed off to another authority. These receipts extend the audit chain; they do not replace Trust Record verification.
+
+Keep the verification results separate:
+
+| Evidence layer           | What to verify                                                                                       | What not to infer                                                                 |
+| ------------------------ | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Session evidence         | TRACE signature, freshness, policy hash, runtime measurement, transcript hash                        | Complete physical-world state                                                     |
+| Action issuance evidence | Canonical action digest, receipt signature, trusted issuer key, session or call binding, chain order | Successful physical completion                                                    |
+| Outcome evidence         | Controller or monitor decision carried by the receipt payload                                        | Functional-safety certification unless the issuer and profile explicitly claim it |
+
+For action receipts, a verifier should distinguish six common outcomes:
+
+| Outcome                    | Meaning                                                                                                                                                                                                                                                                                                |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `receipt_valid_accepted`   | The receipt is well-formed, trusted, bound to the call, and reports acceptance.                                                                                                                                                                                                                        |
+| `receipt_valid_rejected`   | The receipt is well-formed, trusted, bound to the call, and reports controller or policy rejection. This is valid negative evidence.                                                                                                                                                                   |
+| `receipt_missing_required` | The profile required a receipt, and none was present for the consequential action, with no valid `GapDisclosure` occupying its position in the chain. Silent absence, treated as presumptively adversarial (spec section 3.3.4).                                                                       |
+| `receipt_gap_disclosed`    | Required receipts are absent, and a valid `GapDisclosure` occupies their position in the chain: the emitter reported the loss and sealed the report into the chain. Emitter-attested negative evidence, distinct from silence; whether it is accepted is a verifier policy input (spec section 3.3.4). |
+| `receipt_invalid`          | The receipt is present but fails signature, digest, freshness, ordering, or call-binding checks against a key the verifier holds.                                                                                                                                                                      |
+| `receipt_unverified`       | The receipt names an issuer key the verifier has not pinned, and nothing else failed. Per section 3.3.2 of the spec this is unverified, not invalid: the receipt confers no trust and proves no wrongdoing, surfaced with an advisory rather than a failure.                                           |
+
+The key boundary is that a valid rejection is not malformed evidence. It is evidence that the downstream authority declined the action. A valid acceptance also remains action-level evidence; it does not prove the requested physical or business outcome completed unless a stricter profile defines and trusts that external outcome claim.
+
+## What verification proves
+
+| Claim verified                                 | What it means                                                                                      |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Signature valid against a trusted key          | That key signed the authenticated record bytes                                                     |
+| Independently appraised hardware/key binding   | The accepted evidence binds this key to the environment under the producing profile                |
+| Policy artifact matches its hash               | The supplied artifact matches the signed commitment; execution needs separate evidence             |
+| Transcript artifact matches its hash           | The supplied transcript matches the commitment; completeness is not established by the hash alone  |
+| Receipt valid against a trusted log/checkpoint | The bound record was included under that checkpoint; availability and completeness remain separate |
+
+## What verification does NOT prove
+
+Verification establishes the checks actually performed against the supplied evidence and trust inputs. It does not:
+
+- Prove the signing key is still trusted; offline verification cannot prove non-revocation, so pass a `revocation` store
+- Prove the agent's internal reasoning was sound
+- Prove the policy was correctly authored for the intent
+- Prove tool call *contents* (only the hash of the transcript is in v0.1)
+- Prove how the artifact was built past the depth recorded in `appraisal.provenance_depth_verified`; [Build provenance depth](https://trace.agentrust-io.com/docs/build-provenance-depth/index.md) states what each stopping point leaves unknown
+- Prove physical completion or functional-safety compliance for externally consequential actions
+- Replace ongoing monitoring
+
+See [Limitations](https://trace.agentrust-io.com/LIMITATIONS/index.md) for the full list.
