@@ -1,0 +1,58 @@
+# Roadmap
+
+This page shows what TRACE already does, what comes next, and what it will never try to do. It is for anyone deciding whether TRACE fits their plans, or looking for a place to help.
+
+Status as of October 2026. Spec **v0.2** is current ([`spec/trace-v0.2.md`](https://trace.agentrust-io.com/spec/trace-v0.2/index.md)); the `agentrust-trace` reference SDK (the Python library) is at **0.11.0** and the conformance suite (`trace-spec/conformance`, the tests that score an implementation) at **0.6.2**.
+
+## Shipped: v0.2 (July to August 2026)
+
+In short: v0.2 fixed the record's identifier, added links between records when one agent hands work to another, published the format for anchoring records in a public log, and added connectors for AGT, cMCP and sandboxed agent runtimes. The detail follows.
+
+- **EAT profile URI cutover** to `tag:agentrust-io.com,2026:trace-v0.2`. The v0.1 identifier named a domain this project never controlled, which RFC 4151 does not permit, so it was invalid rather than misspelled. A v0.2 verifier requires the new URI and rejects the old one; `verify_record()` enforces the cutover before any cryptographic work. Records issued under v0.1 stay verifiable against `spec/trace-v0.1.md` and the published 0.4.x releases.
+- **`delegation` link block** (`parent_record_hash` + `credential_id`), optional and additive. A chain of records linked this way forms an offline-verifiable delegation DAG. This is the foundation the A2A profile binds to, not the profile itself.
+- **`transparency` is optional below Level 2.** A Level 0 or Level 1 record is unanchored and has no receipt to name; that state was previously unrepresentable.
+- **`azure-cvm-sev-snp` platform**, distinct from `amd-sev-snp`, because Azure runs SEV-SNP behind a Hyper-V paravisor and the runtime binding rides a vTPM AK-signed quote rather than a guest-controlled `REPORT_DATA`. A consumer keying on `runtime.platform` can tell the two roots apart.
+- **Revocation at verification time** (`verify_record(..., revocation=...)`). §3.2.1 always required it; the verifier did not do it. A revocation source that cannot answer is rejected rather than treated as a pass.
+- **OWASP Agentic AI Top 10 cross-walk**: [`docs/crosswalks/owasp-agentic-top-10.md`](https://trace.agentrust-io.com/docs/crosswalks/owasp-agentic-top-10/index.md).
+- **Acta decision-receipt cross-walk**: [`docs/crosswalks/acta-decision-receipts.md`](https://trace.agentrust-io.com/docs/crosswalks/acta-decision-receipts/index.md).
+- **MITRE ATLAS cross-walk**: [`docs/crosswalks/mitre-atlas.md`](https://trace.agentrust-io.com/docs/crosswalks/mitre-atlas/index.md).
+- **Anchor and inclusion-proof format published** as [`spec/registry-anchor-v1.md`](https://trace.agentrust-io.com/spec/registry-anchor-v1/index.md), a normative companion covering the `transparency` claim and Level 2. It is the format that lets a third party verify inclusion without trusting the registry operator, and it is published in the spec rather than only in the implementation because an inclusion proof nobody outside can check is not transparency. A conforming verifier can be written from that document alone. `agentrust-io/trace-registry` is public, and checkpoint 1 has been countersigned by an independently operated witness, verified offline against a pinned key ([evidence packet](https://github.com/agentrust-io/trace-registry/tree/main/docs/evidence/witness-2026-09-07)). Closes [#111](https://github.com/agentrust-io/trace-spec/issues/111), which was the highest priority item on this page. What that demonstration does **not** establish is in the registry's own [LIMITATIONS](https://github.com/agentrust-io/trace-registry/blob/main/LIMITATIONS.md): one checkpoint, not continuous or reciprocal witnessing, no proof of registry continuity, and no signed witness time on that capture.
+- **Producer adapters** for AGT, cMCP, and sandboxed agent runtimes, one code path spanning Level 0 and Level 1.
+- **Platform bindings documented** for AMD SEV-SNP, Intel TDX, and NVIDIA H100 ([`docs/platforms/`](https://trace.agentrust-io.com/docs/platforms/index.md)). This SDK verifies the record; verification of the attestation evidence itself lives in `cmcp` and `agent-manifest`, both of which have been run against genuine hardware quotes.
+- **Reference implementation.** cMCP enforces Cedar policy inside the TEE and emits signed GatewayClaims carrying `policy`, `data_class`, and `tool_transcript`.
+
+## Next: v0.3
+
+In short: the next version defines exactly how TRACE records describe tool calls (MCP) and agent-to-agent hand-offs (A2A), and starts on evidence for an agent's memory, encrypted records and vendor-specific hardware notes.
+
+- **MCP profile (normative)**: the [requirements proposal](https://trace.agentrust-io.com/spec/mcp-profile-v0.3-draft/index.md) separates TRACE attempt identity, correlation metadata and signed declaration snapshots. Wire format, implementation and adoption remain pending before upstream contribution to MCP spec governance.
+- **A2A profile (normative)**: binding rules over the `delegation` block now that A2A is stable at v1.x, including the mutual case. cA2A is the reference implementation.
+- **Attested memory and persistent state**: a claim for agent memory integrity at runtime, digesting the whole store rather than a manifest of it. Nothing in the ecosystem measures agent memory today; every runtime treats the agent as stateless between actions.
+- **Encrypted claims envelope**: normative profile for JWE / COSE-Encrypt where `data_class` requires confidential transport to verifiers (open question §7 Q5).
+- **Vendor platform annexes**: co-authored informative claim-mapping docs for NVIDIA NRAS, Intel Trust Authority, AMD CoRIM, Azure MAA, GCP Confidential Space. Co-editor seats are open (§4.4); the informative platform docs in `docs/platforms/` are ours, not vendor-co-authored.
+- **Disposition on IETF AIIP**: coordinate with `draft-ritz-aiip`: absorb, supersede, or coexist (open question §7 Q7).
+
+## Later: v1.0 standard (2027)
+
+In short: a stable 1.0 run by its own technical steering committee, with a certification program and verification libraries in more languages.
+
+- TSC governance under "TRACE Specification, a Series of LF Projects, LLC" (formation with LF Projects, LLC complete; the TSC transition under [CHARTER.md](https://trace.agentrust-io.com/CHARTER/index.md) is the remaining step)
+- All §7 open questions resolved
+- Complete conformance certification program
+- Post-quantum signature profile (ML-DSA, tracking NIST SP 800-208)
+- MCP and A2A profiles ratified and proposed to their respective upstream governance bodies
+- A canonical profile URI assigned by the standards home, replacing the provisional tag URI
+- Multi-language verification libraries (Python, TypeScript, Go, Rust)
+
+## What TRACE will not do
+
+TRACE builds on existing standards and leaves several jobs to other tools on purpose:
+
+- Replace RATS, EAT, SLSA, SPIFFE, SCITT, or MCP: TRACE is a profile of these
+- Specify a centralized Trust Record registry: verification is designed to work without one
+- Build a TEE platform: hardware support targets open silicon (TDX, SEV-SNP, NVIDIA CC) and any platform that produces RATS-conformant evidence
+- Adjudicate model alignment or output correctness: TRACE proves what executed and what was in force; correctness is out of scope
+
+## Influencing the roadmap
+
+To suggest a change, open a GitHub issue with the `spec` or `roadmap` label. Items land here when they are implemented and tested, not when they are planned; anything above the "Next" line is exercisable today.
